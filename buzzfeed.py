@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import time
 import logging
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
@@ -17,7 +18,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 
-# —————— CONFIGURATION ——————
+# ——— CONFIG ——————————————————————————————————————————————
 SECTIONS = {
     "news":          "https://www.buzzfeed.com/news/",
     "entertainment": "https://www.buzzfeed.com/entertainment/",
@@ -26,7 +27,7 @@ SECTIONS = {
     "travel":        "https://www.buzzfeed.com/travel/",
 }
 
-HEADERS = {
+HEADERS       = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/605.1.15 (KHTML, like Gecko) "
@@ -34,155 +35,183 @@ HEADERS = {
     ),
     "Accept-Language": "en-US,en;q=0.9",
 }
-SESSION = requests.Session()
+SESSION       = requests.Session()
 SESSION.headers.update(HEADERS)
 
-CSV_FILE  = "buzzfeed_articles.csv"
-BATCH_PER = 50   # How many per section each run
+CSV_FILE      = "buzzfeed_articles.csv"
+BATCH_PER     = 50
+SITEMAP_INDEX = "https://www.buzzfeed.com/sitemap.xml"
+SITEMAP_NS    = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
 
 
-# —————— HELPERS ——————
+# ——— PRELOAD SITEMAP ————————————————————————————————————
+def load_sitemap_urls() -> set[str]:
+    resp = SESSION.get(SITEMAP_INDEX, timeout=15)
+    resp.raise_for_status()
+    root = ET.fromstring(resp.content)
+    sitemap_urls = [
+        loc.text.strip()
+        for loc in root.findall("sm:sitemap/sm:loc", SITEMAP_NS)
+        if loc.text and loc.text.strip().endswith(".xml")
+    ]
+
+    pages: set[str] = set()
+    for sm in sitemap_urls:
+        try:
+            r2 = SESSION.get(sm, timeout=15)
+            r2.raise_for_status()
+        except Exception:
+            continue
+        subroot = ET.fromstring(r2.content)
+        for url_el in subroot.findall("sm:url/sm:loc", SITEMAP_NS):
+            if url_el.text:
+                pages.add(url_el.text.strip())
+
+    logging.info("Loaded %d URLs from sitemap", len(pages))
+    return pages
+
+ALL_SITEMAP_URLS = load_sitemap_urls()
+
+
+# ——— HELPERS —————————————————————————————————————————————
 def load_existing_urls(path: str) -> set[str]:
     if not Path(path).exists():
         return set()
     seen = set()
     with open(path, newline="", encoding="utf-8") as fp:
-        reader = csv.DictReader(fp)
-        for row in reader:
+        for row in csv.DictReader(fp):
             seen.add(row["URL"])
     return seen
 
 
-def get_section_links_rss(section_url: str, label: str) -> list[str]:
-    """
-    Discover the section’s RSS feed via the HTML <link> tag,
-    then parse it to get article URLs.
-    Falls back to section_url.rstrip('/') + '.xml' if not found.
-    """
-    # 1) Fetch the section landing page
-    logging.info("Discovering RSS for %s via HTML", label)
-    page = SESSION.get(section_url, timeout=10)
-    page.raise_for_status()
-    soup = BeautifulSoup(page.text, "html.parser")
+def get_section_links(section_url: str, label: str) -> list[str]:
+    # 1) Try RSS discovery
+    try:
+        page = SESSION.get(section_url, timeout=10)
+        page.raise_for_status()
+        soup = BeautifulSoup(page.text, "html.parser")
+        rss_tag = soup.find("link", {"type": "application/rss+xml"})
+        feed_url = rss_tag["href"].strip() if (rss_tag and rss_tag.get("href")) else section_url.rstrip("/") + ".xml"
+        logging.info("Fetching RSS for %s: %s", label, feed_url)
+        r = SESSION.get(feed_url, timeout=10)
+        r.raise_for_status()
+        feed = feedparser.parse(r.content)
+        links = [e.link.strip() for e in feed.entries if getattr(e, "link", None)]
+        if links:
+            logging.info("→ %d RSS links from %s", len(links), label)
+            return links
+    except Exception as e:
+        logging.warning("RSS failed for %s: %s", label, e)
 
-    # 2) Look for <link type="application/rss+xml">
-    rss_link = soup.find("link", {"type": "application/rss+xml"})
-    if rss_link and rss_link.get("href"):
-        feed_url = rss_link["href"].strip()
-    else:
-        # fallback heuristic
-        feed_url = section_url.rstrip("/") + ".xml"
-
-    logging.info("Using feed URL for %s: %s", label, feed_url)
-    resp = SESSION.get(feed_url, timeout=10)
-    resp.raise_for_status()
-
-    feed = feedparser.parse(resp.content)
-    links = [
-        entry.link.strip()
-        for entry in feed.entries
-        if getattr(entry, "link", None)
+    # 2) Fallback to sitemap
+    prefix = f"https://www.buzzfeed.com/{label}/"
+    matched = [
+        u for u in ALL_SITEMAP_URLS
+        if u.startswith(prefix)
+        and "-" in urlparse(u).path.rstrip("/").split("/")[-1]
     ]
-    logging.info("→ Found %d RSS links in %s", len(links), label)
-    return links
+    logging.info("→ %d sitemap links for %s", len(matched), label)
+    return sorted(matched)
 
 
 def get_soup(url: str) -> BeautifulSoup:
-    resp = SESSION.get(url, timeout=20)
-    resp.raise_for_status()
-    return BeautifulSoup(resp.text, "html.parser")
+    r = SESSION.get(url, timeout=20)
+    r.raise_for_status()
+    return BeautifulSoup(r.text, "html.parser")
 
 
 def count_links(soup: BeautifulSoup, article_url: str) -> tuple[int,int]:
+    """Count internal vs external <a> links in the <article> element."""
     base = urlparse(article_url).netloc
     container = soup.select_one("article") or soup
-    internal = external = 0
+
+    internal = 0
+    external = 0
     for a in container.select("a[href]"):
         dom = urlparse(urljoin(article_url, a["href"])).netloc
-        if dom == "" or dom == base:
+        if dom == "" or base in dom:
             internal += 1
         else:
             external += 1
+
     return internal, external
 
 
-# —————— PARSER ——————
+# ——— PARSER —————————————————————————————————————————————
 def parse_article(url: str) -> dict:
     soup = get_soup(url)
 
     # Publication Date
-    pub_date = ""
-    meta_pub = soup.find("meta", {"property": "article:published_time"})
-    if meta_pub and meta_pub.get("content"):
-        pub_date = meta_pub["content"].strip()
+    pub = soup.find("meta", {"property": "article:published_time"})
+    pub_date = pub["content"].strip() if (pub and pub.get("content")) else ""
 
     # Headline
     h1 = soup.find("h1")
     headline = h1.get_text(strip=True) if h1 else ""
-    headline_len = len(headline.split())
+    hl_len = len(headline.split())
 
-    # Body text & word count
+    # Body & word count
     paras = soup.select("article p")
-    article_text = " ".join(p.get_text(" ", strip=True) for p in paras)
-    word_count = len(article_text.split())
+    text = " ".join(p.get_text(" ", strip=True) for p in paras)
+    wc = len(text.split())
 
     # Link counts
-    internal_links, external_links = count_links(soup, url)
+    il, el = count_links(soup, url)
 
     # Scrape timestamp
-    scrape_date = datetime.now(timezone.utc).isoformat()
+    sd = datetime.now(timezone.utc).isoformat()
 
     return {
-        "Source":            "BuzzFeed",
-        "URL":               url,
-        "Section":           None,  # filled in below
-        "Publication Date":  pub_date,
-        "Headline":          headline,
-        "Headline Length":   headline_len,
-        "Word Count":        word_count,
-        "Internal Links":    internal_links,
-        "External Links":    external_links,
-        "Article Text":      article_text,
-        "Scrape Date":       scrape_date,
+        "Source":           "BuzzFeed",
+        "URL":              url,
+        "Section":          None,  # set below
+        "Publication Date": pub_date,
+        "Headline":         headline,
+        "Headline Length":  hl_len,
+        "Word Count":       wc,
+        "Internal Links":   il,
+        "External Links":   el,
+        "Article Text":     text,
+        "Scrape Date":      sd,
     }
 
 
-# —————— MAIN ——————
+# ——— MAIN ———————————————————————————————————————————————
 def main(limit_per_section: int | None = None):
     seen = load_existing_urls(CSV_FILE)
     new_rows: list[dict] = []
 
-    for label, section_url in SECTIONS.items():
-        urls = get_section_links_rss(section_url, label)
+    for label, sec_url in SECTIONS.items():
+        urls = get_section_links(sec_url, label)
         if limit_per_section:
             urls = urls[:limit_per_section]
 
-        for url in tqdm(urls, desc=label, unit="url"):
-            if url in seen:
+        for u in tqdm(urls, desc=label, unit="url"):
+            if u in seen:
                 continue
             try:
-                data = parse_article(url)
-                data["Section"] = label
-                new_rows.append(data)
-                seen.add(url)
-            except Exception as exc:
-                logging.warning("Failed to parse %s: %s", url, exc)
+                rec = parse_article(u)
+                rec["Section"] = label
+                new_rows.append(rec)
+                seen.add(u)
+            except Exception as ex:
+                logging.warning("parse failed %s: %s", u, ex)
             time.sleep(0.5)
 
-    write_header = not Path(CSV_FILE).exists()
+    write_hdr = not Path(CSV_FILE).exists()
     with open(CSV_FILE, "a", newline="", encoding="utf-8") as fp:
-        writer = csv.DictWriter(fp, fieldnames=[
-            "Source", "URL", "Section", "Publication Date",
-            "Headline", "Headline Length", "Word Count",
-            "Internal Links", "External Links",
-            "Article Text", "Scrape Date"
+        w = csv.DictWriter(fp, fieldnames=[
+            "Source","URL","Section","Publication Date",
+            "Headline","Headline Length","Word Count",
+            "Internal Links","External Links",
+            "Article Text","Scrape Date"
         ])
-        if write_header:
-            writer.writeheader()
-        for row in new_rows:
-            writer.writerow(row)
+        if write_hdr:
+            w.writeheader()
+        for r in new_rows:
+            w.writerow(r)
 
-    logging.info("Done – wrote %d new rows to %s", len(new_rows), CSV_FILE)
+    logging.info("Done – appended %d rows", len(new_rows))
 
 
 if __name__ == "__main__":

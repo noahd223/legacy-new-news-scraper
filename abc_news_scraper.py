@@ -3,6 +3,7 @@ import requests
 import csv
 import re
 from datetime import datetime
+from urllib.parse import urlparse
 
 SECTIONS = {
     "Politics": "https://abcnews.go.com/Politics",
@@ -55,9 +56,46 @@ def extract_article_data(section, url):
         article_word_count = len(body_text.split())
 
         pub_date = ""
-        meta_pub = soup.find('meta', {'property': 'article:published_time'})
-        if meta_pub and meta_pub.has_attr('content'):
-            pub_date = meta_pub['content']
+        pub_element = soup.find('div', {'class': 'jTKbV zIIsP ZdbeE xAPpq QtiLO JQYD'})
+        pub_text = pub_element.get_text(strip=True) if pub_element else ""
+        pub_date = datetime.strptime(pub_text, "%B %d, %Y, %I:%M %p")
+
+        # Links
+        internal_links = 0
+        external_links = 0
+        
+        # Domain set for internal link checking
+        main_domain = "abcnews.go.com"
+
+        # Iterate over all 'a' tags within the article body (paragraphs)
+        links_to_check = []
+        for p in paragraphs:
+            links_to_check.extend(p.find_all('a', href=True))
+
+        for link in links_to_check:
+            href = link['href']
+            
+            if href.startswith('//'): 
+                full_href = "https:" + href
+            elif href.startswith('/'): # Absolute path relative to domain
+                full_href = "https://" + main_domain + href
+            elif not (href.startswith('http://') or href.startswith('https://')): # Relative path or other schemes
+                # Handle relative paths based on current URL (less common in article body links)
+                # Or skip non-http/s links if not relevant (e.g., mailto:, tel:)
+                if url.endswith('/'): # If current URL ends with /, append directly
+                    full_href = url + href
+                else: # If current URL doesn't end with /, assume last segment is file, go up one level
+                    full_href = url[:url.rfind('/') + 1] + href
+            else: # Already a full http/s URL
+                full_href = href
+
+            parsed_link = urlparse(full_href)
+
+            if parsed_link.netloc == main_domain:
+                internal_links += 1
+            elif parsed_link.netloc and parsed_link.scheme in ['http', 'https']: # Ensure it has a domain and is http/s
+                external_links += 1
+
 
         return [
             "ABC News",
@@ -67,7 +105,10 @@ def extract_article_data(section, url):
             headline,
             headline_length,
             article_word_count,
-            datetime.now().isoformat()
+            internal_links,
+            external_links,
+            datetime.now().isoformat(),
+            body_text 
         ]
     except Exception as e:
         print(f"Error scraping article {url}: {e}")
@@ -87,7 +128,9 @@ if __name__ == "__main__":
         csv_writer = csv.writer(csvfile)
         csv_writer.writerow([
             'Source', 'Article URL', 'Article Section', 'Publication Date',
-            'Headline (Text)', 'Headline Length', 'Article Word Count', 'Scrape Date'
+            'Headline (Text)', 'Headline Length', 'Article Word Count',
+            'Number of Internal Links', 'Number of External Links', 'Scrape Date',
+            'Article Body Text'
         ])
         for i, (section, article_url) in enumerate(all_links_list, start=1):
             print(f"[{i}/{total}] Scraping article from section '{section}': {article_url}")

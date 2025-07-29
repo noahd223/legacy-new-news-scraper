@@ -3,7 +3,7 @@ import csv
 import re
 from datetime import datetime
 from playwright.sync_api import sync_playwright
-import time as time_module
+ 
 import copy
 import psycopg2
 from psycopg2 import Error
@@ -85,13 +85,7 @@ def insert_article_data(connection, article_data):
         connection.rollback()
         return False
 
-def random_sleep():
-    """Add fixed delay to speed up the process"""
-    try:
-        time_module.sleep(0.75)
-    except Exception as e:
-        print(f"Error in random_sleep: {e}")
-        pass
+
 
 def get_article_links(page, url, section_name):
     try:
@@ -108,13 +102,13 @@ def get_article_links(page, url, section_name):
         except:
             print("Timeout waiting for content, proceeding anyway...")
         
-        random_sleep()
+
 
         # load more content with fewer scrolls
         print("Scrolling to load more content...")
         for i in range(2): # changed from 3 to 2
             page.evaluate('window.scrollBy(0, window.innerHeight)')
-            random_sleep()
+
             print(f"Scroll {i+1}/2 completed")
 
         content = page.content()
@@ -216,9 +210,7 @@ def extract_article_data(page, section, url):
         print(f"  Navigating to article...")
         page.goto(url, wait_until='domcontentloaded', timeout=20000)
         
-        print(f"  Calling random_sleep...")
-        random_sleep()
-        print(f"  random_sleep completed")
+        # ...existing code...
 
         print(f"  Getting page content...")
         content = page.content()
@@ -433,7 +425,7 @@ if __name__ == "__main__":
             print(f"Found {len(section_links)} articles in {section}")
             all_links.update(section_links)
             print(f"Finished scraping {section} section.\n")
-            random_sleep()
+
 
         # Filter out links that are already in the database
         new_links = [(section, article_url) for (section, article_url) in all_links if article_url not in existing_urls]
@@ -463,8 +455,7 @@ if __name__ == "__main__":
                 print(f"❌ Error processing article {article_url}: {e}")
             
             # add delay between articles
-            if i < total:  # don't sleep after last article
-                random_sleep()
+
         
         print(f"\n📊 Scraping Summary:")
         print(f"✅ Successfully inserted: {successful_inserts} articles")

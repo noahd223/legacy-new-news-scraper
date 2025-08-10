@@ -37,15 +37,12 @@ def load_data():
     # optimized query - only select needed columns and add basic filtering
     query = """
     SELECT 
-        source_name, article_url, article_section, publication_date,
-        headline_text, headline_word_count, article_word_count,
-        num_internal_links, num_external_links, scrape_date
+        *
     FROM articles 
     WHERE headline_text IS NOT NULL 
     AND publication_date IS NOT NULL
     AND headline_word_count > 0 
     AND article_word_count > 0
-    AND article_word_count < 5000
     ORDER BY publication_date DESC
     """
     
@@ -62,6 +59,8 @@ def load_data():
         'article_word_count': 'word_count',
         'num_internal_links': 'internal_links',
         'num_external_links': 'external_links',
+        'num_internal_links_within_body': 'num_internal_links_within_body',
+        'num_external_links_within_body': 'num_external_links_within_body',
         'scrape_date': 'scrape_date'
     }
     
@@ -165,6 +164,44 @@ fig_headline = px.box(
     labels={"headline_len": "Headline Length", "source": "News Source"}
 )
 st.plotly_chart(fig_headline, use_container_width=True)
+
+# New Visualization for Links
+st.subheader("🔗 Internal vs. External Links Analysis")
+st.markdown("Use the checkboxes to compare different link types across articles.")
+
+# Checkboxes for toggling link types
+col1, col2, col3, col4 = st.columns(4)
+show_internal_full = col1.checkbox("Internal Links (Full Article)", value=True)
+show_external_full = col2.checkbox("External Links (Full Article)", value=True)
+show_internal_body = col3.checkbox("Internal Links (Within Body)", value=True)
+show_external_body = col4.checkbox("External Links (Within Body)", value=True)
+
+# create a melted dataframe for the plot based on user selection
+plot_data_links = []
+print(filtered.columns)
+if show_internal_full:
+    plot_data_links.append(pd.DataFrame({'source': filtered['source'], 'value': filtered['internal_links'], 'link_type': 'Internal (Full)'}))
+if show_external_full:
+    plot_data_links.append(pd.DataFrame({'source': filtered['source'], 'value': filtered['external_links'], 'link_type': 'External (Full)'}))
+if show_internal_body:
+    plot_data_links.append(pd.DataFrame({'source': filtered['source'], 'value': filtered['num_internal_links_within_body'], 'link_type': 'Internal (Body)'}))
+if show_external_body:
+    plot_data_links.append(pd.DataFrame({'source': filtered['source'], 'value': filtered['num_external_links_within_body'], 'link_type': 'External (Body)'}))
+
+if plot_data_links:
+    links_df = pd.concat(plot_data_links)
+    fig_links = px.box(
+        links_df,
+        x="source",
+        y="value",
+        color="link_type",
+        points="all",
+        title="Distribution of Links per Article by Source",
+        labels={"value": "Number of Links", "source": "News Source", "link_type": "Link Type"}
+    )
+    st.plotly_chart(fig_links, use_container_width=True)
+else:
+    st.info("Please select at least one link type to visualize.")
 
 st.subheader("📝 Word Count Box Plot")
 fig_word = px.box(
